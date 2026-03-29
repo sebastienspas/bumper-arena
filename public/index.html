@@ -618,8 +618,8 @@ function createCar(color, isPlayer=false){
     const model=carModelTemplate.clone();
     const s=MS();
     model.scale.set(s,s,s);
-    // Rotate so car faces +Z (forward)
-    model.rotation.y=Math.PI;
+    // Model faces -Z by default, no pre-rotation needed
+    // The PI offset is applied in the game loop via playerCar.rotation.y
     // Tint: traverse and colorize the carrosserie material
     model.traverse(child=>{
       if(child.isMesh && child.material){
@@ -720,21 +720,40 @@ async function startMR(){
 
 async function startAR(){
   try{
-    xrSession=await navigator.xr.requestSession('immersive-ar',{
+    // Try with dom-overlay first (needed for UI buttons in AR)
+    let sessionOpts = {
       requiredFeatures:['hit-test'],
       optionalFeatures:['dom-overlay','plane-detection','anchors','local-floor'],
-      domOverlay:{root:document.body}
-    });
+    };
+    // Add dom-overlay root if supported
+    try { sessionOpts.domOverlay = {root: document.body}; } catch(e){}
+
+    xrSession=await navigator.xr.requestSession('immersive-ar', sessionOpts);
     renderer.xr.setReferenceSpaceType('local-floor');
     await renderer.xr.setSession(xrSession);
-    xrRefSpace=await xrSession.requestReferenceSpace('local-floor');
+
+    // Try local-floor first, fall back to local
+    try { xrRefSpace=await xrSession.requestReferenceSpace('local-floor'); }
+    catch(e) { xrRefSpace=await xrSession.requestReferenceSpace('local'); }
+
     const vs=await xrSession.requestReferenceSpace('viewer');
     xrHitTestSrc=await xrSession.requestHitTestSource({space:vs});
-    reticle=new THREE.Mesh(new THREE.RingGeometry(.05,.07,32),new THREE.MeshBasicMaterial({color:0x39ff14,side:THREE.DoubleSide}));
-    reticle.rotation.x=-Math.PI/2;reticle.visible=false;scene.add(reticle);
+
+    reticle=new THREE.Mesh(
+      new THREE.RingGeometry(.05,.07,32),
+      new THREE.MeshBasicMaterial({color:0x39ff14,side:THREE.DoubleSide})
+    );
+    reticle.rotation.x=-Math.PI/2;
+    reticle.visible=false;
+    reticle.matrixAutoUpdate=false;
+    scene.add(reticle);
+
     document.getElementById('placement').classList.add('show');
+
     xrSession.addEventListener('end',()=>{xrSession=null;});
+    // 'select' fires on screen tap in AR on mobile
     xrSession.addEventListener('select',onXRSelect);
+
     renderer.setAnimationLoop(gameLoop);
   }catch(e){
     console.warn('AR failed:',e);mode='desktop';arenaPlaced=true;
@@ -742,7 +761,27 @@ async function startAR(){
   }
 }
 
-function onXRSelect(){if(!arenaPlaced&&reticle&&reticle.visible)confirmPlacement();else if(repositionMode&&reticle&&reticle.visible)confirmPlacement();}
+let lastHitPose=null; // store last valid hit pose
+
+function onXRSelect(){
+  // Screen tap in AR mode
+  if(!arenaPlaced || repositionMode){
+    // Place arena at last known hit position, or reticle position
+    if(lastHitPose){
+      arenaGroup.position.set(lastHitPose.x, lastHitPose.y, lastHitPose.z);
+      arenaGroup.updateMatrix();
+      arenaPlaced=true;repositionMode=false;
+      document.getElementById('placement').classList.remove('show');
+      if(document.getElementById('btn-repos'))document.getElementById('btn-repos').classList.remove('active');
+      if(reticle)reticle.visible=false;
+      if(mode==='mr'||mode==='ar'){
+        document.getElementById('ar-controls').classList.add('show');
+      }
+    } else if(reticle&&reticle.visible){
+      confirmPlacement();
+    }
+  }
+}
 
 function setupXRControllers(){
   for(let i=0;i<2;i++){
@@ -769,13 +808,18 @@ function readXRInput(){
 //  PLACEMENT + REPOSITION + SCALE
 // ================================================================
 function confirmPlacement(){
+  // Try reticle position first, then lastHitPose fallback
   if(reticle&&reticle.visible){
-    arenaGroup.position.copy(reticle.position);
-    arenaGroup.updateMatrix();
+    const pos=new THREE.Vector3();
+    pos.setFromMatrixPosition(reticle.matrix);
+    arenaGroup.position.copy(pos);
+  } else if(lastHitPose){
+    arenaGroup.position.set(lastHitPose.x, lastHitPose.y, lastHitPose.z);
   }
+  arenaGroup.updateMatrix();
   arenaPlaced=true;repositionMode=false;
   document.getElementById('placement').classList.remove('show');
-  document.getElementById('btn-repos').classList.remove('active');
+  if(document.getElementById('btn-repos'))document.getElementById('btn-repos').classList.remove('active');
   if(reticle)reticle.visible=false;
   // Show AR controls
   if(mode==='mr'||mode==='ar'){
@@ -784,11 +828,10 @@ function confirmPlacement(){
 }
 
 function toggleReposition(){
-  if(!xrSession)return;
   repositionMode=!repositionMode;
+  lastHitPose=null; // reset so user must aim again
   document.getElementById('btn-repos').classList.toggle('active',repositionMode);
   if(repositionMode){
-    // Re-enable hit test reticle
     if(reticle){reticle.visible=true;scene.add(reticle);}
     document.getElementById('placement').classList.add('show');
   } else {
@@ -842,12 +885,19 @@ function rebuildScene(){
 function gameLoop(ts,frame){
   const dt=clock.getDelta(),time=clock.getElapsedTime();
 
-  // Hit test
+  // Hit test for AR/MR placement
   if((!arenaPlaced||repositionMode)&&frame&&xrHitTestSrc&&xrRefSpace){
     const hits=frame.getHitTestResults(xrHitTestSrc);
     if(hits.length>0){
       const pose=hits[0].getPose(xrRefSpace);
-      if(pose){reticle.visible=true;reticle.position.set(pose.transform.position.x,pose.transform.position.y,pose.transform.position.z);}
+      if(pose){
+        const p=pose.transform.position;
+        lastHitPose={x:p.x, y:p.y, z:p.z};
+        if(reticle){
+          reticle.visible=true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+        }
+      }
     }
   }
 
@@ -969,7 +1019,8 @@ function updatePlayer(dt){
   if(ud.velocity.length()>maxSpd)ud.velocity.normalize().multiplyScalar(maxSpd);
 
   playerCar.position.add(ud.velocity);
-  playerCar.rotation.y=ud.angle;
+  // Model faces -Z, our movement is +Z, so offset by PI
+  playerCar.rotation.y=ud.angle+Math.PI;
 
   // Boost timer
   if(boosting){boostTimer-=dt*1000;if(boostTimer<=0){boosting=false;boostTimer=CFG.boostCD;}}
@@ -1015,7 +1066,7 @@ function updateAI(dt){
     const fwd=new THREE.Vector3(Math.sin(ud.angle),0,Math.cos(ud.angle));
     ud.velocity.add(fwd.multiplyScalar(CS()*.65));
     ud.velocity.multiplyScalar(CFG.friction);
-    car.position.add(ud.velocity);car.rotation.y=ud.angle;
+    car.position.add(ud.velocity);car.rotation.y=ud.angle+Math.PI;
   });
 }
 
